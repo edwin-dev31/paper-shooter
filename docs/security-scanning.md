@@ -2,7 +2,9 @@
 
 The Security workflow runs a quick [Strix](https://github.com/usestrix/strix) scan scoped to the
 files a pull request changes, measured against `origin/<base branch>`. Maintainers can also start it
-manually from the Actions tab with any branch or commit as the diff base. Strix sends its LLM
+manually from the Actions tab with the `base` input (default `origin/main`), accepting any branch or
+commit as the diff base; that value is passed to Strix as `STRIX_DIFF_BASE` through `--diff-base`.
+Strix sends its LLM
 requests to the deployed [OmniRoute](https://omniroute.hagicode.com/) OpenAI-compatible endpoint
 with the model `openai/auto`, so OmniRoute chooses the provider and model for each request. The
 workflow installs a pinned Strix release and verifies its SHA-256 before running it. Moving to a

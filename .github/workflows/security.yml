@@ -2,6 +2,13 @@ name: Security Scan
 
 on:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base branch or commit to diff against (e.g. origin/main or a SHA)
+        required: true
+        default: origin/main
+        type: string
 
 jobs:
   strix-scan:
@@ -20,4 +27,5 @@ jobs:
           STRIX_LLM: auto
           LLM_API_BASE: ${{ vars.OMNIROUTE_BASE_URL }}
           LLM_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
-        run: strix -n -t ./ --scan-mode quick
+          STRIX_DIFF_BASE: ${{ inputs.base || format('origin/{0}', github.base_ref) }}
+        run: strix -n -t ./ --scan-mode quick --diff-base "$STRIX_DIFF_BASE"
