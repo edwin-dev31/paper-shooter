@@ -13,6 +13,8 @@ on:
 jobs:
   strix-scan:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      report-uploaded: ${{ steps.upload_report.outputs.artifact-id != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,3 +31,36 @@ jobs:
           LLM_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
           STRIX_DIFF_BASE: ${{ inputs.base || format('origin/{0}', github.base_ref) }}
         run: strix -n -t ./ --scan-mode quick --diff-base "$STRIX_DIFF_BASE"
+
+      - name: Upload Strix report
+        id: upload_report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strix-report
+          path: strix_runs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  upload-sarif:
+    needs: strix-scan
+    if: >-
+      always() &&
+      needs.strix-scan.outputs.report-uploaded == 'true' &&
+      vars.STRIX_SARIF_UPLOAD == 'true'
+    permissions:
+      contents: read
+      security-events: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: strix-report
+          path: strix_runs
+
+      - uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: strix_runs/
+          category: strix
