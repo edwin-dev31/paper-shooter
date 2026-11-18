@@ -1,187 +1,22 @@
-name: Security
+name: Security Scan
 
 on:
   pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened]
-  workflow_dispatch:
-    inputs:
-      diff-base:
-        description: Branch or commit that bounds the scanned diff
-        required: true
-        default: main
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions: {}
-
-env:
-  STRIX_VERSION: 1.7.1
-  STRIX_SHA256: c8e836251578baa228afe9e65f4a901ef6ae1116c444f8f0a67f7ae7898c480f
 
 jobs:
-  fork-notice:
-    name: Strix scan (fork skipped)
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+  strix-scan:
     runs-on: ubuntu-latest
     steps:
-      - name: Explain the skipped scan
-        run: |
-          message="Strix needs the OmniRoute credential, which GitHub does not expose to fork pull requests. A maintainer can scan this change from a same-repository branch or with a manual run."
-          echo "::notice title=Strix scan skipped::$message"
-          echo "$message" >> "$GITHUB_STEP_SUMMARY"
-
-  strix:
-    name: Strix scan
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    permissions:
-      contents: read
-    outputs:
-      sarif: ${{ steps.report.outputs.sarif }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
-
-      - name: Check OmniRoute configuration
-        env:
-          OMNIROUTE_BASE_URL: ${{ vars.OMNIROUTE_BASE_URL }}
-          OMNIROUTE_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
-        run: |
-          if [ -z "$OMNIROUTE_BASE_URL" ]; then
-            echo "::error title=Missing configuration::Set the OMNIROUTE_BASE_URL Actions variable, for example https://omniroute.example.com/v1." >&2
-            exit 1
-          fi
-          if [ -z "$OMNIROUTE_API_KEY" ]; then
-            echo "::error title=Missing configuration::Set the OMNIROUTE_API_KEY Actions secret." >&2
-            exit 1
-          fi
-          base_url="${OMNIROUTE_BASE_URL%/}"
-          case "$base_url" in
-            https://*/v1) ;;
-            *)
-              echo "::error title=Invalid configuration::OMNIROUTE_BASE_URL must be the HTTPS OpenAI-compatible base ending in /v1." >&2
-              exit 1
-              ;;
-          esac
-          status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
-            -H "Authorization: Bearer $OMNIROUTE_API_KEY" "$base_url/models") || status=000
-          case "$status" in
-            2??) ;;
-            401 | 403)
-              echo "::error title=OmniRoute authentication failed::OmniRoute rejected OMNIROUTE_API_KEY (HTTP $status). Rotate the key in OmniRoute and update the secret." >&2
-              exit 1
-              ;;
-            *)
-              echo "::error title=OmniRoute unavailable::GET $base_url/models returned HTTP $status. Check that the endpoint is deployed and reachable from GitHub-hosted runners." >&2
-              exit 1
-              ;;
-          esac
-          echo "LLM_API_BASE=$base_url" >> "$GITHUB_ENV"
 
       - name: Install Strix
-        run: |
-          archive="strix-$STRIX_VERSION-linux-x86_64"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive.tar.gz" \
-            "https://github.com/usestrix/strix/releases/download/v$STRIX_VERSION/$archive.tar.gz"
-          echo "$STRIX_SHA256  $RUNNER_TEMP/$archive.tar.gz" | sha256sum --check --strict -
-          mkdir -p "$RUNNER_TEMP/strix/bin"
-          tar -xzf "$RUNNER_TEMP/$archive.tar.gz" -C "$RUNNER_TEMP/strix"
-          install -m 0755 "$RUNNER_TEMP/strix/$archive" "$RUNNER_TEMP/strix/bin/strix"
-          echo "$RUNNER_TEMP/strix/bin" >> "$GITHUB_PATH"
+        run: curl -sSL https://strix.ai/install | bash
 
-      - name: Resolve diff base
+      - name: Run Security Scan
         env:
-          BASE_REF: ${{ github.event_name == 'pull_request' && github.base_ref || inputs.diff-base }}
-        run: |
-          if git rev-parse --verify --quiet "origin/$BASE_REF^{commit}" > /dev/null; then
-            diff_base="origin/$BASE_REF"
-          elif git rev-parse --verify --quiet "$BASE_REF^{commit}" > /dev/null; then
-            diff_base="$BASE_REF"
-          else
-            echo "::error title=Unknown diff base::Cannot resolve '$BASE_REF' as a branch or commit." >&2
-            exit 1
-          fi
-          echo "DIFF_BASE=$diff_base" >> "$GITHUB_ENV"
-
-      - name: Run Strix
-        env:
-          STRIX_LLM: openai/auto
+          STRIX_LLM: auto
+          LLM_API_BASE: ${{ vars.OMNIROUTE_BASE_URL }}
           LLM_API_KEY: ${{ secrets.OMNIROUTE_API_KEY }}
-          STRIX_FAIL_ON: ${{ vars.STRIX_FAIL_ON || 'high' }}
-          STRIX_MAX_BUDGET: ${{ vars.STRIX_MAX_BUDGET || '10' }}
-        run: |
-          set +e
-          strix -n --target ./ --scan-mode quick --scope-mode diff --diff-base "$DIFF_BASE" \
-            --max-budget "$STRIX_MAX_BUDGET" --fail-on "$STRIX_FAIL_ON"
-          code=$?
-          set -e
-
-          run_json=$(find strix_runs -name run.json -printf '%T@ %p\n' 2> /dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)
-          status=$( [ -n "$run_json" ] && jq -r '.status // "unknown"' "$run_json" || echo missing)
-          cost=$( [ -n "$run_json" ] && jq -r '.llm_usage.cost // "unknown"' "$run_json" || echo unknown)
-          {
-            echo "### Strix scan"
-            echo "- Diff base: \`$DIFF_BASE\`"
-            echo "- Exit code: \`$code\`, run status: \`$status\`"
-            echo "- LLM cost: \`$cost\` of \`$STRIX_MAX_BUDGET\` USD budget"
-            echo "- Gate: findings at \`$STRIX_FAIL_ON\` severity or above"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          failed=0
-          if [ "$code" -eq 1 ] || [ "$code" -gt 2 ]; then
-            echo "::error title=Strix setup failed::Strix exited with code $code before finishing. Check the log for OmniRoute model/auth errors, Docker or diff-scope resolution." >&2
-            failed=1
-          fi
-          if [ "$status" != completed ]; then
-            echo "::error title=Strix scan incomplete::Run status is '$status', not 'completed'. If the budget was exhausted, raise the STRIX_MAX_BUDGET variable." >&2
-            failed=1
-          fi
-          if [ "$code" -eq 2 ]; then
-            echo "::error title=Strix found vulnerabilities::At least one finding meets the '$STRIX_FAIL_ON' gate. See the strix-report artifact or Code Scanning." >&2
-            failed=1
-          fi
-          exit "$failed"
-
-      - name: Locate SARIF report
-        id: report
-        if: always()
-        run: |
-          if find strix_runs -name '*.sarif' -print -quit 2> /dev/null | grep -q .; then
-            echo "sarif=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        if: always()
-        with:
-          name: strix-report
-          path: strix_runs/
-          if-no-files-found: ignore
-          retention-days: 14
-
-  code-scanning:
-    name: Upload Strix SARIF
-    needs: strix
-    if: always() && vars.STRIX_SARIF_UPLOAD == 'true' && needs.strix.outputs.sarif == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: strix-report
-          path: strix_runs
-      - uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
-        with:
-          sarif_file: strix_runs
-          category: strix
+        run: strix -n -t ./ --scan-mode quick
